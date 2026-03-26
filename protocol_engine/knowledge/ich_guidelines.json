@@ -1,0 +1,51 @@
+{
+  "E6_R3": {
+    "title": "Good Clinical Practice",
+    "sections": {
+      "5.0": "Risk-Based Quality Management",
+      "5.0.3": "Quality Tolerance Limits",
+      "6.0": "Source data verification",
+      "6.6": "Safety reporting rules"
+    }
+  },
+  "E8_R1": {
+    "title": "Quality by Design",
+    "key_concepts": ["Critical to quality factors", "Quality by design"]
+  },
+  "E9_R1": {
+    "title": "Statistical Principles",
+    "sections": {
+      "2.2.5": "Multiplicity adjustment",
+      "2.3": "Randomization and stratification",
+      "3.5": "Sample size determination",
+      "4": "Primary analysis timing",
+      "4.5": "Interim analyses and stopping rules"
+    },
+    "estimand_framework": {
+      "components": ["Population", "Variable", "Intercurrent events", "Summary measure"]
+    }
+  },
+  "E2A": {
+    "title": "Safety Reporting",
+    "timelines": {
+      "SAE": "24 hours",
+      "ICSR_regulatory": "15 calendar days",
+      "fatal_life_threatening": "7 days"
+    }
+  },
+  "M11": {
+    "title": "CeSHarP - Clinical electronic Structured Harmonised Protocol",
+    "sections": {
+      "1": "Protocol summary/synopsis",
+      "3": "Objectives and endpoints",
+      "4": "Overall design",
+      "5": "Study population",
+      "5.1": "Eligibility criteria",
+      "6.1": "Study intervention",
+      "6.2": "Concomitant medications",
+      "6.4": "Schedule of activities",
+      "9": "Safety monitoring",
+      "10": "Statistical considerations"
+    }
+  }
+}
