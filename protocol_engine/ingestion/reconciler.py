@@ -180,7 +180,7 @@ def _align_columns(
                 best_score = score
                 best_v_idx = v_idx
 
-        if best_score >= 0.5 or best_v_idx < len(vision_headers):
+        if best_score >= 0.5:
             mapping[t_idx] = best_v_idx
 
     return mapping

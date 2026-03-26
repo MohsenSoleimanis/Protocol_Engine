@@ -1,17 +1,12 @@
 """
-Protocol Store — Self-contained content store for the new package.
+Protocol Store — Content store for parsed protocol data.
 
-Wraps JSON data from the ingestion pipeline and provides section/table
-lookup methods used by the retrieval engine and graph nodes.
-
-This replaces the old knowledge_base/protocol_store.py import with a
-clean, self-contained version that has NO old-code dependencies.
+Wraps JSON from ingestion, provides section/table lookup.
 """
 from __future__ import annotations
 
 import json
 import re
-import hashlib
 import logging
 from pathlib import Path
 
@@ -19,141 +14,97 @@ logger = logging.getLogger(__name__)
 
 
 class ProtocolStore:
-    """In-memory store for a parsed protocol document."""
-
     def __init__(self, data: dict | str | Path):
-        """Initialize from a dict or JSON file path."""
         if isinstance(data, (str, Path)):
             with open(data, encoding="utf-8") as f:
                 self._data = json.load(f)
         else:
             self._data = data
 
-        self._section_index: dict[str, dict] = {}
-        self._page_content: dict[int, list[dict]] = {}
-        self._table_index: dict[str, dict] = {}
+        self._sections: dict[str, dict] = {}
+        self._pages: dict[int, list[dict]] = {}
+        self._tables: dict[str, dict] = {}
         self._page_tables: dict[int, list[str]] = {}
-        self._pdf_path: str | None = None
+        self._build()
 
-        self._build_indexes()
-
-    def _build_indexes(self):
-        for section in self._data.get("sections", []):
-            number = section.get("number", section.get("id", ""))
-            if number:
-                self._section_index[number] = section
-
-        for page in self._data.get("pages", []):
-            self._page_content[page["page_num"]] = page.get("content_blocks", [])
-
-        for table in self._data.get("tables", []):
-            tid = table.get("id", "")
+    def _build(self):
+        for s in self._data.get("sections", []):
+            num = s.get("number", s.get("id", ""))
+            if num:
+                self._sections[num] = s
+        for p in self._data.get("pages", []):
+            self._pages[p["page_num"]] = p.get("content_blocks", [])
+        for t in self._data.get("tables", []):
+            tid = t.get("id", "")
             if tid:
-                self._table_index[tid] = table
-                for p in table.get("page_range", []):
+                self._tables[tid] = t
+                for p in t.get("page_range", []):
                     self._page_tables.setdefault(p, []).append(tid)
 
     def get_section(self, section_id: str) -> dict | None:
-        """Retrieve a section's complete content."""
-        section = self._section_index.get(section_id)
+        section = self._sections.get(section_id)
         if not section:
             return None
 
-        # Use content_blocks if available
         blocks = section.get("content_blocks", [])
         if blocks:
-            text_parts = []
-            block_pages = set()
-            for block in blocks:
-                text = block.get("text", "") if isinstance(block, dict) else ""
-                source = block.get("source", {}) if isinstance(block, dict) else {}
-                page = source.get("page")
-                if page is not None:
-                    block_pages.add(page)
+            parts, block_pages = [], set()
+            for b in blocks:
+                text = b.get("text", "") if isinstance(b, dict) else ""
+                pg = (b.get("source", {}) if isinstance(b, dict) else {}).get("page")
+                if pg is not None:
+                    block_pages.add(pg)
                 if text.strip():
-                    text_parts.append(text)
-
-            all_pages = sorted(block_pages) if block_pages else section.get("page_range", [])
-            for p in all_pages:
+                    parts.append(text)
+            pages = sorted(block_pages) if block_pages else section.get("page_range", [])
+            for p in pages:
                 for tid in self._page_tables.get(p, []):
-                    table = self._table_index.get(tid)
-                    if table:
-                        table_text = self._format_table(table)
-                        text_parts.append(f"[Table: {table.get('caption', tid)}]\n{table_text}")
+                    t = self._tables.get(tid)
+                    if t:
+                        parts.append(f"[Table: {t.get('caption', tid)}]\n{self._fmt_table(t)}")
+            return {"section_id": section.get("number", section_id),
+                    "title": section.get("title", ""), "pages": pages,
+                    "content": "\n\n".join(parts)}
 
-            content = "\n\n".join(text_parts)
-            return {
-                "section_id": section.get("number", section_id),
-                "title": section.get("title", ""),
-                "level": section.get("level", 0),
-                "pages": sorted(block_pages) if block_pages else all_pages,
-                "content": content,
-            }
-
-        # Fallback: page-range reconstruction
         pages = section.get("page_range", [])
         if not pages:
             return None
-
-        text_parts = []
+        parts = []
         for p in pages:
-            page_text = self._get_page_text(p)
-            if page_text.strip():
-                text_parts.append(f"[Page {p}]\n{page_text}")
+            pt = "\n".join(b.get("text", "") for b in self._pages.get(p, []) if b.get("text"))
+            if pt.strip():
+                parts.append(f"[Page {p}]\n{pt}")
             for tid in self._page_tables.get(p, []):
-                table = self._table_index.get(tid)
-                if table:
-                    text_parts.append(f"[Table: {table.get('caption', tid)}]\n{self._format_table(table)}")
-
-        content = "\n\n".join(text_parts)
-        return {
-            "section_id": section.get("number", section_id),
-            "title": section.get("title", ""),
-            "level": section.get("level", 0),
-            "pages": pages,
-            "content": content,
-        }
-
-    def get_table(self, table_id: str) -> dict | None:
-        """Retrieve a specific table."""
-        return self._table_index.get(table_id)
+                t = self._tables.get(tid)
+                if t:
+                    parts.append(f"[Table: {t.get('caption', tid)}]\n{self._fmt_table(t)}")
+        return {"section_id": section.get("number", section_id),
+                "title": section.get("title", ""), "pages": pages,
+                "content": "\n\n".join(parts)}
 
     @property
     def all_section_ids(self) -> list[str]:
-        return sorted(
-            self._section_index.keys(),
-            key=lambda x: [int(p) for p in re.findall(r'\d+', x)] or [9999],
-        )
+        return sorted(self._sections.keys(),
+                      key=lambda x: [int(p) for p in re.findall(r'\d+', x)] or [9999])
 
     @property
     def all_table_ids(self) -> list[str]:
-        return sorted(self._table_index.keys())
+        return sorted(self._tables.keys())
 
     @property
     def metadata(self) -> dict:
-        return {
-            "filename": self._data.get("filename", ""),
-            "total_pages": self._data.get("total_pages", 0),
-            "total_sections": len(self._section_index),
-            "total_tables": len(self._table_index),
-        }
+        return {"filename": self._data.get("filename", ""),
+                "total_pages": self._data.get("total_pages", 0),
+                "sections": len(self._sections), "tables": len(self._tables)}
 
-    def _get_page_text(self, page_num: int) -> str:
-        blocks = self._page_content.get(page_num, [])
-        return "\n".join(b.get("text", "") for b in blocks if b.get("text"))
-
-    def _format_table(self, table: dict) -> str:
+    def _fmt_table(self, t: dict) -> str:
         lines = []
-        headers = table.get("column_headers", [])
-        rows = table.get("rows", [])
-        if headers:
-            lines.append(" | ".join(str(h) for h in headers))
+        hdrs = t.get("column_headers", [])
+        if hdrs:
+            lines.append(" | ".join(str(h) for h in hdrs))
             lines.append("-" * 40)
-        for row in rows:
+        for row in t.get("rows", []):
             lines.append(" | ".join(str(c) for c in row))
-        footnotes = table.get("footnotes", {})
-        if footnotes:
-            lines.append("")
-            for marker, text in footnotes.items():
-                lines.append(f"  {marker}. {text}")
+        for marker, text in t.get("footnotes", {}).items():
+            lines.append(f"  {marker}. {text}")
         return "\n".join(lines)

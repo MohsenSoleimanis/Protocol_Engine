@@ -74,11 +74,11 @@ def validate(extracted_data: dict, context: str) -> dict:
 
         if section_id:
             section_id = str(section_id)
-            sec_found = (
-                f"section {section_id}" in context_lower
+            # Use word boundary to avoid "5" matching "15.3"
+            import re as _re
+            sec_found = bool(
+                _re.search(rf'\b{_re.escape(section_id)}\b', context)
                 or f"§{section_id}" in context
-                or section_id + "." in context
-                or section_id + " " in context
             )
             result["checks"]["section_ref"] = "V" if sec_found else f"W {section_id} not found"
 

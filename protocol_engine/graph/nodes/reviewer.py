@@ -1,13 +1,14 @@
 """
-Reviewer Node — Semantic-only review (complements deterministic validator).
+Reviewer — Semantic-only checks (complements deterministic validator).
 
-Key fixes from old code:
-  1. Reviewer receives validator output — no duplicate work
-  2. ONLY checks what validator CANNOT: hallucination, semantic accuracy,
-     cross-section contradiction, clinical plausibility
-  3. get_extraction() returns ALL data (old code ignored the parameter)
-  4. get_gathered_content() has no char truncation producing invalid state
-  5. Signals use proper append reducer (old code dropped all but last)
+Only checks what the validator CANNOT:
+  - Hallucination (plausible but not in source)
+  - Semantic accuracy (right text, wrong interpretation)
+  - Clinical plausibility (500mg/kg dose?)
+  - Cross-section contradiction
+
+Receives validator results. Does NOT re-check source grounding or numbers.
+Decides: DONE or NEED_MORE (cycle back to Explorer).
 """
 from __future__ import annotations
 
@@ -19,190 +20,148 @@ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableConfig
 
-from protocol_engine.config import LLM_MODEL, OPENAI_API_KEY, MAX_REVIEWER_TURNS, get_langfuse_handler
-from protocol_engine.models.enums import EdgeSignal, NodeName
+from protocol_engine.config import LLM_MODEL, OPENAI_API_KEY, MAX_CYCLES, get_langfuse_handler
+from protocol_engine.models.enums import EdgeSignal
 from protocol_engine.models.state import get_runtime
+from protocol_engine.tools.knowledge import lookup_knowledge
 
 logger = logging.getLogger(__name__)
 
+MAX_TURNS = 8
 
 SYSTEM = """You are a SKEPTICAL clinical protocol reviewer.
 
-The deterministic validator has ALREADY checked:
-  - Source grounding (exact text match)
-  - Numerical accuracy (numbers match source)
-  - Section references (section IDs exist)
-  - Schema completeness (required fields present)
+The deterministic validator ALREADY checked: source grounding, numbers, completeness.
 
-YOUR job is ONLY to check things the validator CANNOT:
-  1. HALLUCINATION: Is any extracted information plausible but NOT in the source?
-  2. SEMANTIC ACCURACY: Is the meaning correct? (right text but wrong interpretation?)
-  3. CROSS-SECTION CONTRADICTION: Do different parts of the extraction contradict?
-  4. CLINICAL PLAUSIBILITY: Are clinical values reasonable? (e.g. 500mg/kg dose?)
+YOUR job (things the validator CANNOT check):
+  1. HALLUCINATION: Is anything plausible but NOT in the source?
+  2. SEMANTIC ACCURACY: Right text but wrong interpretation?
+  3. CLINICAL PLAUSIBILITY: Are values reasonable?
+  4. CROSS-SECTION CONTRADICTION: Do parts of the extraction conflict?
 
-Do NOT re-check source grounding or numbers — the validator already did that.
+Do NOT re-check source grounding or numbers.
 
 WORKFLOW:
-  1. get_extraction() — see the extracted JSON
-  2. get_validation_results() — see what the validator already found
-  3. get_gathered_content() — see the source content (call ONCE)
-  4. flag_signal() for verified semantic issues only
-  5. submit_review()
+  1. get_extraction() → see the extracted data
+  2. get_validation() → see what the validator found
+  3. get_context() → see the source content (call ONCE)
+  4. flag() for verified semantic issues
+  5. done()
 
-SIGNAL TYPES:
-  hallucination (critical): Data not supported by gathered content
-  completeness (critical): Important items in content but missing from extraction
-  consistency (major): Contradictions within the extraction
-  cross_reference (critical): Unresolved references in content
+SEVERITY: critical = extraction is WRONG. major = potential issue. minor = cosmetic.
+Only use critical if you're CERTAIN."""
 
-USE critical ONLY when extraction is WRONG or INCOMPLETE.
-DO NOT flag items from OTHER extraction types or internal schema fields."""
+VALID_SIGNAL_TYPES = {"hallucination", "completeness", "consistency", "plausibility"}
 
 
 def reviewer_node(state: dict, config: RunnableConfig) -> dict:
-    """Reviewer node — semantic-only checks, receives validator results."""
     runtime = get_runtime(config)
     bus = runtime.event_bus
     qt = state.get("query_type", "general")
-    extractions = state.get("extracted_data", {})
+    extracted = state.get("extracted_data", {})
     validation = state.get("validation", {})
     context = state.get("assembled_context", "")
 
-    if not extractions:
-        return {
-            "signals": [],
-            "edge_signal": EdgeSignal.DONE,
-            "steps": [{"agent": NodeName.REVIEWER, "turns": 0,
-                       "tool_calls": 0, "tools_used": []}],
-        }
+    if not extracted:
+        return {"signals": [], "edge_signal": EdgeSignal.DONE,
+                "steps": [{"agent": "reviewer", "turns": 0}]}
 
     if bus:
-        bus.emit(NodeName.REVIEWER, "starting", "Reviewing extraction...")
+        bus.emit("reviewer", "starting", "Reviewing...")
 
-    # Build tools
+    # Build review tools
     signals = []
-    content_shown = [False]
+    context_shown = [False]
 
     @tool
     def get_extraction() -> str:
         """View the complete extracted data."""
-        return json.dumps(extractions, indent=2, default=str)
+        return json.dumps(extracted, indent=2, default=str)
 
     @tool
-    def get_validation_results() -> str:
-        """View deterministic validation results (already computed)."""
+    def get_validation() -> str:
+        """View deterministic validation results."""
         if not validation:
-            return "No validation results available."
-        summary = (
-            f"Verified: {validation.get('verified', 0)}/{validation.get('total', 0)}, "
-            f"Flagged: {validation.get('flagged', 0)}, "
-            f"Failed: {validation.get('failed', 0)}"
-        )
-        failed_details = [
-            f"  {d.get('item', '')}: {d.get('verdict', '')} - {d.get('checks', {})}"
-            for d in validation.get("details", [])
-            if d.get("verdict", "").startswith("FAILED")
-        ]
-        if failed_details:
-            summary += "\n\nFailed items:\n" + "\n".join(failed_details[:10])
-        return summary
+            return "No validation results."
+        s = (f"Verified: {validation.get('verified', 0)}/{validation.get('total', 0)}, "
+             f"Failed: {validation.get('failed', 0)}")
+        fails = [f"  {d['item']}: {d['verdict']}" for d in validation.get("details", [])
+                 if d.get("verdict", "").startswith("FAILED")]
+        if fails:
+            s += "\n" + "\n".join(fails[:10])
+        xf = validation.get("cross_field", [])
+        if xf:
+            s += "\nCross-field issues: " + "; ".join(xf)
+        return s
 
     @tool
-    def get_gathered_content() -> str:
+    def get_context() -> str:
         """View the gathered protocol content. Call ONCE."""
-        if content_shown[0]:
-            return "[Already shown — use the content from before.]"
-        content_shown[0] = True
-        if not context:
-            return "No gathered content available."
-        return context
+        if context_shown[0]:
+            return "[Already shown.]"
+        context_shown[0] = True
+        return context or "No content available."
 
     @tool
-    def flag_signal(signal_type: str, severity: str, title: str, description: str) -> str:
-        """Flag a verified semantic issue. Only for things the validator cannot check."""
-        signals.append({
-            "signal_type": signal_type,
-            "severity": severity,
-            "title": title,
-            "description": description,
-        })
-        logger.info(f"Reviewer signal: [{severity}] {signal_type}: {title}")
+    def flag(signal_type: str, severity: str, title: str, description: str) -> str:
+        """Flag a verified semantic issue."""
+        if signal_type not in VALID_SIGNAL_TYPES:
+            return f"Invalid type '{signal_type}'. Use: {VALID_SIGNAL_TYPES}"
+        if severity not in ("critical", "major", "minor"):
+            return f"Invalid severity. Use: critical, major, minor"
+        signals.append({"signal_type": signal_type, "severity": severity,
+                        "title": title, "description": description})
         return f"Recorded: [{severity}] {title}"
 
     @tool
-    def submit_review(summary: str) -> str:
+    def done(summary: str) -> str:
         """Submit completed review."""
         return f"Review done: {summary}. {len(signals)} signals."
 
-    tools = [get_extraction, get_validation_results, get_gathered_content,
-             flag_signal, submit_review]
+    tools = [get_extraction, get_validation, get_context, flag, done, lookup_knowledge]
 
     lf = get_langfuse_handler()
-    callbacks = [lf] if lf else []
-    llm = ChatOpenAI(
-        model=LLM_MODEL, api_key=OPENAI_API_KEY,
-        temperature=0.1, callbacks=callbacks,
-    ).bind_tools(tools)
+    cbs = [lf] if lf else []
+    llm = ChatOpenAI(model=LLM_MODEL, api_key=OPENAI_API_KEY,
+                     temperature=0.1, callbacks=cbs).bind_tools(tools)
 
     msgs = [
         SystemMessage(content=SYSTEM),
-        HumanMessage(content=(
-            f"Review the {qt} extraction. "
-            f"The validator already checked {validation.get('total', 0)} items: "
-            f"{validation.get('verified', 0)} verified, "
-            f"{validation.get('failed', 0)} failed. "
-            f"Focus on semantic issues the validator cannot catch."
-        )),
+        HumanMessage(content=f"Review the {qt} extraction. "
+                     f"Validator: {validation.get('verified',0)}/{validation.get('total',0)} verified, "
+                     f"{validation.get('failed',0)} failed. Focus on semantic issues."),
     ]
     tmap = {t.name: t for t in tools}
     turns = 0
-    tclog = []
 
-    for turn in range(1, MAX_REVIEWER_TURNS + 1):
+    for turn in range(1, MAX_TURNS + 1):
         turns = turn
         resp = llm.invoke(msgs)
         msgs.append(resp)
-        if resp.tool_calls:
-            for tc in resp.tool_calls:
-                tclog.append(tc["name"])
-                logger.info(f"Reviewer turn {turn}: {tc['name']}")
-                if bus:
-                    desc = {
-                        "get_extraction": "Reading extraction...",
-                        "get_validation_results": "Reading validation...",
-                        "get_gathered_content": "Reading source content...",
-                        "flag_signal": f"Flagging: {tc['args'].get('title', '')}",
-                        "submit_review": "Submitting review...",
-                    }.get(tc["name"], tc["name"])
-                    bus.emit_tool(NodeName.REVIEWER, tc["name"], desc)
-                fn = tmap.get(tc["name"])
-                try:
-                    result = fn.invoke(tc["args"]) if fn else f"Unknown: {tc['name']}"
-                except Exception as e:
-                    result = f"Error: {e}"
-                msgs.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
-        else:
-            logger.info(f"Reviewer done: {turn} turns, {len(signals)} signals")
+        if not resp.tool_calls:
             break
+        for tc in resp.tool_calls:
+            fn = tmap.get(tc["name"])
+            try:
+                result = fn.invoke(tc["args"]) if fn else f"Unknown: {tc['name']}"
+            except Exception as e:
+                result = f"Error: {e}"
+            msgs.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
 
-    # Determine edge signal
-    critical_signals = [s for s in signals if s.get("severity") == "critical"]
+    # Decide: cycle or done
+    critical = [s for s in signals if s.get("severity") == "critical"]
     cycle_count = state.get("cycle_count", 0)
 
-    if critical_signals and cycle_count < 2:
-        edge_signal = EdgeSignal.NEED_MORE_CONTENT
-        edge_detail = "; ".join(s["title"] for s in critical_signals[:3])
+    if critical and cycle_count < MAX_CYCLES:
+        edge_signal = EdgeSignal.NEED_MORE
     else:
         edge_signal = EdgeSignal.DONE
-        edge_detail = ""
 
     if bus:
-        bus.emit(NodeName.REVIEWER, "done", f"{len(signals)} signals")
+        bus.emit("reviewer", "done", f"{len(signals)} signals")
 
     return {
         "signals": signals,
         "edge_signal": edge_signal,
-        "edge_detail": edge_detail,
-        "steps": [{"agent": NodeName.REVIEWER, "turns": turns,
-                   "tool_calls": len(tclog), "tools_used": tclog}],
+        "steps": [{"agent": "reviewer", "turns": turns, "signals": len(signals)}],
     }

@@ -1,1 +1,1 @@
-"""Protocol Engine graph nodes."""
+"""Graph nodes — Explorer, Extractor, Reviewer."""

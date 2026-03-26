@@ -1,1 +1,1 @@
-"""Protocol Engine graph — LangGraph pipeline with 7 nodes."""
+"""Protocol Engine graph — 3-node LangGraph pipeline."""

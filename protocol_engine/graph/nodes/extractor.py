@@ -1,14 +1,8 @@
 """
-Extractor Node — LLM-based structured extraction into Pydantic schemas.
+Extractor — Structured extraction + deterministic validation.
 
-Key fixes from old code:
-  1. Extractor LLM sees ACTUAL content (old code only showed a summary)
-  2. Single LLM call with content + schema (old code had extract() tool calling
-     a SEPARATE LLM, so the deciding LLM never saw the content)
-  3. Knowledge appendices loaded from JSON files (not hardcoded dict)
-  4. No truncation of tool results to 10k chars
-  5. request_more_content uses typed EdgeSignal (not "NEED_MORE:" string)
-  6. No keyword filter blocking request_more_content
+The LLM sees ACTUAL content (not a summary). One call extracts,
+then deterministic validation runs inline. Cross-field checks included.
 """
 from __future__ import annotations
 
@@ -18,250 +12,204 @@ import time
 
 from pydantic import BaseModel, ValidationError
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 
 from protocol_engine.config import (
     LLM_MODEL, OPENAI_API_KEY, MAX_TOKENS,
     KNOWLEDGE_DIR, get_openai_client, get_langfuse_handler,
 )
-from protocol_engine.models.enums import EdgeSignal, NodeName
+from protocol_engine.models.enums import EdgeSignal
 from protocol_engine.models.state import get_runtime
 from protocol_engine.validation.validator import validate
 
 logger = logging.getLogger(__name__)
 
+SYSTEM_PROMPT = """You are a clinical protocol extraction specialist.
 
-BASE_SYSTEM_PROMPT = """You are a clinical protocol extraction specialist.
-
-The context may contain [Page N] markers, [Table: ...] blocks, or raw protocol text.
-Use these markers for grounding: copy page numbers into your grounding fields.
-
-EXTRACTION RULES:
-
-1. COMPLETENESS: Extract EVERY item you find in the provided content.
-   If inclusion has 8 criteria, extract all 8. Do NOT summarize or merge.
-
-2. PRESERVE DETAIL: Include ALL sub-bullets, sub-criteria, and definitions.
-
-3. PRESERVE THRESHOLDS: Include ALL clinical numbers verbatim.
-   WRONG: "fever threshold" -> RIGHT: "fever (>= 38C)"
-
-4. GROUNDING: EVERY extracted item MUST have grounding:
-   - section_id: the section number from the context
-   - page: integer page number from [Page N] markers (NEVER 0 or -1)
-   - exact_source_text: verbatim quote 10-80 chars from the source
-   - confidence: 0.9 for verbatim, 0.7 for paraphrased, 0.5 if unsure
-
-5. CRITICAL — "NOT IN CONTEXT" ≠ "NOT IN PROTOCOL":
-   You are seeing a SUBSET of the protocol, not the entire document.
-   If you cannot find information about a topic, add it to the 'gaps' field.
-   Do NOT claim the protocol LACKS something unless the text explicitly says so.
+RULES:
+1. COMPLETENESS: Extract EVERY item. Do not summarize or merge.
+2. PRESERVE THRESHOLDS: Include ALL clinical numbers verbatim.
+   WRONG: "fever threshold" → RIGHT: "fever (>= 38C)"
+3. GROUNDING: Every item needs section_id, page (from [Page N] markers),
+   exact_source_text (10-80 char verbatim quote), confidence (0.9/0.7/0.5).
+4. "NOT IN CONTEXT" ≠ "NOT IN PROTOCOL": You see a SUBSET.
+   If you can't find something, add to 'gaps' field. Don't claim it's missing.
 """
 
 
-def _load_appendix(schema_name: str) -> str:
-    """Load domain knowledge appendix for a schema from JSON files."""
-    appendix_map = {
-        "DeviationRuleSet": "cdisc",
-        "KRIExtraction": "sdtm_mappings",
-    }
-    domain = appendix_map.get(schema_name)
-    if not domain:
-        return ""
-    path = KNOWLEDGE_DIR / f"{domain}.json"
-    if not path.exists():
-        return ""
-    try:
-        data = json.loads(path.read_text())
-        return json.dumps(data, indent=2)[:3000]
-    except Exception:
-        return ""
-
-
 def extractor_node(state: dict, config: RunnableConfig) -> dict:
-    """Extractor node — structured extraction with content VISIBLE to the LLM.
-
-    Critical difference from old code: the LLM that decides what to extract
-    IS the same LLM that sees the content. No indirection through tools.
-    """
     runtime = get_runtime(config)
     bus = runtime.event_bus
     qt = state.get("query_type", "general")
-    assembled_context = state.get("assembled_context", "")
+    context = state.get("assembled_context", "")
 
-    # Fallback: if context assembler didn't run, build from raw sections
-    if not assembled_context:
-        sections = state.get("sections_content", {})
-        tables = state.get("tables_content", {})
-        if not sections and not tables:
-            return {
-                "extracted_data": {},
-                "validation": {},
-                "edge_signal": EdgeSignal.DONE,
-                "error": "No content available for extraction",
-                "steps": [{"agent": NodeName.EXTRACTOR, "turns": 0,
-                           "tool_calls": 0, "tools_used": []}],
-            }
-        # Build context from raw content
-        parts = []
-        for sid, data in sections.items():
-            parts.append(f"[§{sid}]\n{data.get('text', '')}")
-        for tid, data in tables.items():
-            parts.append(f"[TABLE: {tid}]\n{data.get('text', '')}")
-        assembled_context = "\n\n---\n\n".join(parts)
-
-    if bus:
-        bus.emit(NodeName.EXTRACTOR, "starting",
-                 f"Extracting {qt} from ~{len(assembled_context) // 4} tokens...")
-
-    # Get schema class
-    from protocol_engine.models.schemas import SCHEMA_MAP
-    schema_class = SCHEMA_MAP.get(qt, SCHEMA_MAP.get("general"))
-    if not schema_class:
+    if not context:
+        logger.warning("Extractor: no assembled context")
         return {
             "extracted_data": {},
             "validation": {},
-            "edge_signal": EdgeSignal.ERROR_FATAL,
-            "error": f"No schema for query type: {qt}",
-            "steps": [{"agent": NodeName.EXTRACTOR, "turns": 0,
-                       "tool_calls": 0, "tools_used": []}],
+            "edge_signal": EdgeSignal.DONE,
+            "steps": [{"agent": "extractor", "error": "no context"}],
         }
 
-    schema_name = schema_class.__name__
-    appendix = _load_appendix(schema_name)
+    if bus:
+        bus.emit("extractor", "starting", f"Extracting {qt}...")
 
-    # Build the extraction prompt — LLM sees REAL content
-    system = f"""{BASE_SYSTEM_PROMPT}
+    # Get schema
+    from protocol_engine.models.schemas import SCHEMA_MAP
+    schema_class = SCHEMA_MAP.get(qt, SCHEMA_MAP.get("general"))
 
-EXTRACT: {qt} information. Fill every field in the schema.
-{f'DOMAIN KNOWLEDGE:{chr(10)}{appendix}' if appendix else ''}"""
+    # Load domain knowledge appendix if applicable
+    appendix = _load_appendix(schema_class.__name__ if schema_class else "")
 
-    user_msg = f"""Extract all {qt} information from the following protocol content.
-
-PROTOCOL CONTENT:
-{assembled_context}"""
-
-    logger.info(
-        f"Extractor: {qt}, ~{(len(system) + len(user_msg)) // 4} tokens input"
-    )
+    system = f"{SYSTEM_PROMPT}\nEXTRACT: {qt} information. Fill every field.\n{appendix}"
+    user_msg = f"Extract all {qt} information.\n\nPROTOCOL CONTENT:\n{context}"
 
     t0 = time.time()
-    result, raw_text, info = _extract_with_structured_output(
-        system, user_msg, schema_class,
-    )
+    result, raw, info = _extract(system, user_msg, schema_class)
     elapsed = time.time() - t0
 
     if result is None:
-        logger.warning(f"Extraction failed: {info.get('error', 'unknown')}")
+        logger.warning(f"Extraction failed: {info}")
         if bus:
-            bus.emit(NodeName.EXTRACTOR, "done", "Extraction failed")
+            bus.emit("extractor", "done", "Extraction failed")
         return {
             "extracted_data": {},
             "validation": {},
-            "edge_signal": EdgeSignal.ERROR_RETRY,
-            "error": f"Extraction failed: {info.get('error', '')}",
-            "steps": [{"agent": NodeName.EXTRACTOR, "turns": 1,
-                       "tool_calls": 0, "tools_used": [info.get("method", "")]}],
+            "edge_signal": EdgeSignal.DONE,
+            "steps": [{"agent": "extractor", "error": str(info), "elapsed": round(elapsed, 1)}],
         }
 
-    # Convert to dict
     extracted = result.model_dump() if isinstance(result, BaseModel) else result
 
-    # Run deterministic validation
-    val_result = validate(extracted, assembled_context)
+    # Deterministic validation (source text, not full context — FIX C6)
+    val = validate(extracted, context)
 
-    logger.info(
-        f"Extractor done: {len(extracted)} keys, "
-        f"{val_result.get('verified', 0)}/{val_result.get('total', 0)} verified, "
-        f"{elapsed:.1f}s"
-    )
+    # Cross-field consistency (was in Reconciler, now inline)
+    _cross_field_check(extracted, val)
+
+    logger.info(f"Extractor: {val.get('verified',0)}/{val.get('total',0)} verified, {elapsed:.1f}s")
     if bus:
-        bus.emit(NodeName.EXTRACTOR, "done",
-                 f"{val_result.get('verified', 0)}/{val_result.get('total', 0)} verified")
+        bus.emit("extractor", "done", f"{val.get('verified',0)}/{val.get('total',0)} verified")
 
     return {
         "extracted_data": extracted,
-        "validation": val_result,
-        "extraction_history": [{"query_type": qt, "method": info.get("method", ""),
-                                "elapsed": round(elapsed, 1)}],
-        "edge_signal": EdgeSignal.CONTINUE,
-        "steps": [{"agent": NodeName.EXTRACTOR, "turns": 1,
-                   "tool_calls": 0, "tools_used": [info.get("method", "")]}],
+        "validation": val,
+        "edge_signal": EdgeSignal.DONE,
+        "steps": [{"agent": "extractor", "method": info.get("method", ""),
+                   "elapsed": round(elapsed, 1),
+                   "verified": val.get("verified", 0), "total": val.get("total", 0)}],
     }
 
 
-def _extract_with_structured_output(
-    system: str, user_msg: str, schema_class: type,
-) -> tuple:
-    """Extract using LangChain structured output, with JSON mode fallback.
-
-    Returns: (parsed_result, raw_text, info_dict)
-    """
-    from protocol_engine.utils import parse_llm_json
-
+def _extract(system: str, user_msg: str, schema_class: type) -> tuple:
+    """Structured output with JSON-mode fallback. Returns (result, raw, info)."""
     lf = get_langfuse_handler()
-    callbacks = [lf] if lf else []
+    cbs = [lf] if lf else []
 
-    # Strategy 1: Structured output (function calling)
+    # Strategy 1: LangChain structured output
     try:
-        llm = ChatOpenAI(
-            model=LLM_MODEL, api_key=OPENAI_API_KEY,
-            temperature=0.1, max_tokens=MAX_TOKENS, callbacks=callbacks,
-        )
-        structured_llm = llm.with_structured_output(schema_class, include_raw=True)
-        response = structured_llm.invoke([
+        llm = ChatOpenAI(model=LLM_MODEL, api_key=OPENAI_API_KEY,
+                         temperature=0.1, max_tokens=MAX_TOKENS, callbacks=cbs)
+        structured = llm.with_structured_output(schema_class, include_raw=True)
+        resp = structured.invoke([
             {"role": "system", "content": system},
             {"role": "user", "content": user_msg},
         ])
-
-        if isinstance(response, dict):
-            result = response.get("parsed")
-            raw_msg = response.get("raw")
-            raw_content = raw_msg.content if raw_msg and hasattr(raw_msg, "content") else ""
-            if result and isinstance(result, BaseModel):
-                return result, result.model_dump_json(), {"valid": True, "method": "structured_output"}
+        if isinstance(resp, dict):
+            parsed = resp.get("parsed")
+            if parsed and isinstance(parsed, BaseModel):
+                return parsed, parsed.model_dump_json(), {"method": "structured_output"}
             # Try salvage from raw
-            if raw_content:
-                parsed = parse_llm_json(raw_content)
-                if parsed:
-                    try:
-                        result = schema_class.model_validate(parsed)
-                        return result, result.model_dump_json(), {"valid": True, "method": "raw_salvage"}
-                    except ValidationError:
-                        pass
-        elif isinstance(response, BaseModel):
-            return response, response.model_dump_json(), {"valid": True, "method": "structured_output"}
-
+            raw_msg = resp.get("raw")
+            if raw_msg and hasattr(raw_msg, "content") and raw_msg.content:
+                return _try_parse(raw_msg.content, schema_class, "raw_salvage")
+        elif isinstance(resp, BaseModel):
+            return resp, resp.model_dump_json(), {"method": "structured_output"}
     except Exception as e:
         logger.warning(f"Structured output failed: {e}")
 
     # Strategy 2: JSON mode fallback
     try:
         client = get_openai_client()
-        schema_fields = list(schema_class.model_fields.keys())
-        json_system = system + f"\n\nReturn ONLY valid JSON with fields: {schema_fields}."
-
-        response = client.chat.completions.create(
+        fields = list(schema_class.model_fields.keys())
+        resp = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
-                {"role": "system", "content": json_system},
+                {"role": "system", "content": system + f"\nReturn ONLY JSON with fields: {fields}"},
                 {"role": "user", "content": user_msg},
             ],
-            max_tokens=MAX_TOKENS,
-            temperature=0.1,
+            max_tokens=MAX_TOKENS, temperature=0.1,
             response_format={"type": "json_object"},
         )
-        raw_text = response.choices[0].message.content or ""
-        parsed = parse_llm_json(raw_text)
-        if parsed:
-            try:
-                result = schema_class.model_validate(parsed)
-                return result, raw_text, {"valid": True, "method": "json_mode_fallback"}
-            except ValidationError:
-                return parsed, raw_text, {"valid": False, "method": "json_mode_fallback"}
-
+        raw = resp.choices[0].message.content or ""
+        return _try_parse(raw, schema_class, "json_mode")
     except Exception as e:
-        logger.error(f"Both extraction strategies failed: {e}")
+        logger.error(f"Both strategies failed: {e}")
+        return None, "", {"error": str(e)}
 
-    return None, "", {"error": "both strategies failed", "method": "both_failed"}
+
+def _try_parse(raw: str, schema_class: type, method: str) -> tuple:
+    """Try to parse raw JSON into schema."""
+    import re
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1] if "\n" in cleaned else cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned.rsplit("```", 1)[0]
+    cleaned = cleaned.strip()
+
+    for attempt in [cleaned, raw]:
+        try:
+            data = json.loads(attempt)
+            result = schema_class.model_validate(data)
+            return result, raw, {"method": method}
+        except (json.JSONDecodeError, ValidationError):
+            pass
+
+    # Last resort: find outermost braces
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
+    if start >= 0 and end > start:
+        try:
+            data = json.loads(raw[start:end])
+            result = schema_class.model_validate(data)
+            return result, raw, {"method": f"{method}_brace"}
+        except (json.JSONDecodeError, ValidationError):
+            pass
+
+    return None, raw, {"error": "parse_failed", "method": method}
+
+
+def _cross_field_check(extracted: dict, validation: dict):
+    """Inline cross-field consistency checks (was Reconciler node)."""
+    details = validation.setdefault("cross_field", [])
+
+    # Endpoint count match
+    endpoints = extracted.get("endpoints", [])
+    total = extracted.get("total", {})
+    if isinstance(endpoints, list) and isinstance(total, dict):
+        actual = sum(1 for e in endpoints if isinstance(e, dict) and e.get("category") == "Primary")
+        declared = total.get("primary", 0)
+        if declared > 0 and actual != declared:
+            details.append(f"Declared {declared} primary endpoints but extracted {actual}")
+
+    # Arms count match
+    arms = extracted.get("arms", [])
+    n_arms = extracted.get("number_of_arms", 0)
+    if isinstance(arms, list) and n_arms > 0 and len(arms) != n_arms:
+        details.append(f"Declared {n_arms} arms but extracted {len(arms)}")
+
+
+def _load_appendix(schema_name: str) -> str:
+    mapping = {"DeviationRuleSet": "cdisc", "KRIExtraction": "sdtm_mappings"}
+    domain = mapping.get(schema_name)
+    if not domain:
+        return ""
+    path = KNOWLEDGE_DIR / f"{domain}.json"
+    if not path.exists():
+        return ""
+    try:
+        return json.dumps(json.loads(path.read_text()), indent=2)[:3000]
+    except Exception:
+        return ""
