@@ -285,6 +285,247 @@ Reviewer sees extractions but NOT the validator's quality assessment. It re-deri
 
 ---
 
+## DEEP DIVE: CONTEXT ENGINEERING — Where It Happens and What's Broken
+
+There is **no context engineering** in this codebase. What exists is a series of ad-hoc char-limit truncations scattered across 4 files. Here's the complete data flow:
+
+### The Current "Context Pipeline" (Broken)
+
+```
+Explorer (_schema_gather)          Explorer (_agentic_gather)
+  │                                  │
+  │ Retrieves sections/tables        │ LLM decides what to search
+  │ NO relevance scoring             │ NO relevance scoring
+  │ NO ranking                       │ Budget = 100k/60k chars (hardcoded)
+  │                                  │
+  ▼                                  ▼
+state["sections_content"]    ◄── merge ──►   state["tables_content"]
+  │                                            │
+  │  Dict of {section_id: {text, pages, chars}}│
+  │  NO ordering by relevance                  │
+  │  NO scoring                                │
+  │                                            │
+  ▼────────────────────────────────────────────▼
+                    │
+         extractor_node.py:85-113
+         "Context Assembly" (BROKEN)
+                    │
+  1. Iterate sections_read in ORDER THEY WERE FOUND (not relevance)
+  2. For each: if char_count + len(text) > 80k → STOP (greedy break)
+  3. Then iterate remaining tables, same greedy break at 80k
+  4. Join everything with "\n\n"
+  5. That's it. No ranking, no filtering, no summarization.
+                    │
+                    ▼
+         content string (up to 80k chars)
+                    │
+         ┌──────────┴──────────┐
+         │                     │
+    NEVER SENT TO LLM    Passed to extract()
+    (extractor_node:148)  tool via closure
+    LLM only sees a       (extractor_node:33)
+    summary like:
+    "Gathered content:
+     5 sections, 3 tables.
+     Total: 45000 chars."
+         │                     │
+         ▼                     ▼
+    LLM decides blind    extraction/extractor.py:141
+    whether to extract   Finally sees the content
+    or request_more      as user_msg to a DIFFERENT
+                         LLM call (structured output)
+```
+
+### Specific Problems
+
+**1. Zero relevance scoring** — `extractor_node.py:89-103`
+Sections are iterated in `sections_read` order (insertion order from retrieval). A section with 0.95 relevance score and one with 0.3 are treated identically. If a low-relevance 30k-char section is read first, it eats the budget and the high-relevance section gets dropped.
+
+**2. Greedy truncation wastes budget** — `extractor_node.py:99-100`
+```python
+if char_count + len(text) > content_limit:
+    break  # stops on first item that doesn't fit
+```
+If item A is 60k chars and doesn't fit, the loop breaks. But items B (5k), C (3k), D (2k) would all fit. The greedy approach leaves ~70k chars of budget unused.
+
+**3. Char-based, not token-based** — `extractor_node.py:83`
+`content_limit = 80000` chars ≈ 20k tokens (rough). But model context windows are measured in tokens. 80k chars of ASCII text vs 80k chars of clinical abbreviations have very different token counts. No tiktoken or equivalent.
+
+**4. The Extractor LLM is blind** — `extractor_node.py:143-148`
+The ReAct agent only receives:
+```
+"Gathered content: 5 sections (3.1, 3.2, 5.1, 9.2, 11), 3 tables (tbl_1, tbl_2, tbl_3). Total: 45000 chars."
+```
+It NEVER sees the actual protocol text. It then calls `extract()` which fires a SEPARATE LLM call with the full content. The ReAct agent cannot:
+- Judge if content is sufficient
+- Decide which sections matter more
+- Request specific sections
+- Compare source text against extraction
+
+**5. No context passed between cycles** — `state.py:27-28`
+`sections_content` uses `_merge_dicts` (shallow merge). On cycle re-entry, the Explorer adds NEW sections to state. The Extractor rebuilds the full content from scratch including OLD + NEW sections. But there's no prioritization of new vs old — the new content (what was specifically requested) might be at the end and get truncated.
+
+**6. Reviewer gets even less context** — `reviewer.py:70-85`
+The reviewer has a SEPARATE 40k char limit (hardcoded), iterates sections in dict order (arbitrary), and can only call `get_gathered_content()` ONCE (`content_shown` flag). After that first call, if context scrolled out of the LLM's attention, there's no way to re-read it.
+
+**7. No tiered assembly**
+Every section is included verbatim or not at all. No option for:
+- High-relevance: full text
+- Medium-relevance: key paragraphs
+- Low-relevance: one-line summary
+This means a 20k-char section that's only marginally relevant takes the same space as one that's critical.
+
+**8. No context for the Reviewer to leverage validation**
+`extractor_node.py:189-191` stores `validation` in state. But `reviewer.py:111` reads `extracted_data` and never reads `validation`. The reviewer re-derives quality assessment from scratch, duplicating work the validator already did (see next section).
+
+### What Should Exist
+
+A dedicated **Context Assembly** node between Explorer and Extractor that:
+1. Scores each section's relevance to the query + schema fields
+2. Ranks by relevance score (not retrieval order)
+3. Tiers: verbatim (>0.8), key paragraphs (0.5-0.8), summary (<0.5)
+4. Assembles within a **token** budget, not char budget
+5. Passes the assembled context directly to the Extractor LLM (not via a blind tool call)
+6. On cycles, prioritizes newly-fetched content
+
+---
+
+## DEEP DIVE: BROKEN LINKS, EDGES, AND TOOLS
+
+### Broken Graph Edges
+
+**1. `explorer_node` returns `"agent": "Gatherer"` but cycle counting checks `"agent": "Explorer"`**
+- `explorer.py:333`: `"agent": "Gatherer"` (schema-gather path)
+- `explorer.py:304`: `"agent": "Explorer"` (agentic path)
+- `graph.py:24`: `sum(1 for s in steps if s.get("agent") == "Explorer")`
+- **Result**: First pass is never counted. System allows `max_cycles + 1` runs.
+
+**2. `route_after_extractor` silently ends on empty extraction**
+- `graph.py:28-30`: If `extracted_data` is empty AND no `NEED_MORE:` error → goes to `END`
+- No edge to retry, no edge to Explorer, no error surfaced
+- **Result**: If extraction fails silently (e.g., schema mismatch), the query returns empty with no explanation
+
+**3. `set_reviewer_error` only passes first signal, edge is lossy**
+- `graph.py:55`: `actionable[0].get('description', '')[:200]`
+- If reviewer flags 3 critical issues, only the first one's description (truncated to 200 chars) reaches the Explorer
+- The other 2 signals are lost in the edge
+
+**4. `signals` state field has no reducer — replacement not append**
+- `state.py:36`: `signals: list[dict]` — no `Annotated[list, operator.add]`
+- When reviewer writes `{"signals": [...]}`, it REPLACES previous signals
+- In current linear flow this is fine, but if cycles add another reviewer pass, the previous signals vanish
+
+**5. Dead edge: `"pages"` type never produced**
+- `explorer.py:300`: `if item["type"] in ("section", "pages"): secs[item["id"]] = entry`
+- No code ever creates an item with `type="pages"`. This branch of the conditional is dead code.
+
+### Broken Tools
+
+**6. `get_extraction(extraction_type)` ignores its parameter**
+- `reviewer.py:56-59`: Accepts `extraction_type: str` but always returns ALL extractions via `json.dumps(extractions)`
+- The LLM thinks it can request specific types. It can't. Tool description misleads the LLM.
+
+**7. `extract(schema_type)` uses LLM-provided argument unsafely**
+- `extractor_node.py:33`: `run_extract(query_type=schema_type)` uses whatever the LLM passes
+- No validation that `schema_type` is a valid key in `SCHEMA_MAP`
+- If LLM passes `"endpoint"` instead of `"endpoints"`, extraction fails
+
+**8. `request_more_content` is filtered by keyword, not intent**
+- `extractor_node.py:174-178`: If the reason contains "failed", "flagged", "validation", or "verified", the request is suppressed
+- "The eligibility section **failed** to include age ranges" → suppressed
+- Legitimate content requests get blocked by keyword collision
+
+**9. `vision_extract` pages parameter not deduplicated**
+- `explorer.py:241`: `key = tuple(sorted(pages))` — `[1,1,2]` caches as `(1,1,2)` not `(1,2)`
+- Duplicate pages waste vision API calls
+
+**10. Tool result truncation corrupts data**
+- `explorer.py:290`: `str(result)[:10000]` — if result is JSON, truncation at 10k chars produces invalid JSON
+- `extractor_node.py:38`: `json.dumps(extracted)[:10000]` — same problem
+- `extractor_node.py:168`: `str(result)[:15000]` — same pattern, different magic number
+- `reviewer.py:59`: `json.dumps(extractions)[:15000]` — same
+- **Result**: LLM receives truncated, invalid JSON and must parse it or hallucinate the rest
+
+### Missing Edges
+
+**11. No edge from empty extraction to retry**
+If Extractor produces nothing (schema mismatch, API error), graph goes to END. Should route back to Explorer or surface an error.
+
+**12. No edge for transient errors**
+API timeouts, rate limits, and network errors all crash the current node. No retry edge, no fallback edge. The only catch is the top-level `except Exception` in `run_query`.
+
+**13. No edge from Reviewer to Extractor**
+Reviewer can only route back to Explorer (via `set_reviewer_error`). If the issue is extraction quality (not missing content), there's no way to re-run just the Extractor with the same content but different instructions.
+
+---
+
+## DEEP DIVE: VALIDATOR vs REVIEWER — Redundancy Analysis
+
+### What Each Does
+
+| Aspect | Validator (`extraction/validator.py`) | Reviewer (`agents/reviewer.py`) |
+|---|---|---|
+| **Type** | Deterministic code, zero LLM | LLM agent with tools |
+| **Cost** | Free (CPU only) | $0.01-0.05 per run (LLM calls) |
+| **Input** | `extracted_data` dict + `content` string | `extracted_data` + `sections_content` + `tables_content` |
+| **When called** | Inside Extractor node (line 181) or by extract tool (line 45) | After Extractor, as separate graph node |
+| **Output** | `{verified, flagged, failed, total, details}` | `signals` list of `{signal_type, severity, title, description}` |
+| **Can trigger cycle** | No (stored in state, but never checked by router) | Yes (critical signals → `set_reviewer_error` → Explorer) |
+
+### The Overlap
+
+Both check for **the same categories of issues**:
+
+| Check | Validator | Reviewer |
+|---|---|---|
+| Source grounding (is text in context?) | Yes — substring match on first 40 chars | Yes — LLM reads content and compares |
+| Numerical accuracy | Yes — number set comparison (broken, checks entire context) | Yes — LLM reads numbers and compares |
+| Section reference exists | Yes — string match `section_id + "."` in context | Yes — LLM checks cross-refs |
+| Completeness | Yes — only 2 patterns (endpoint timing, FULL automation) | Yes — LLM checks if items in content are missing from extraction |
+| Hallucination detection | Partially — source grounding only | Yes — LLM can spot fabricated content |
+| Cross-item consistency | No | Yes — LLM can compare across extracted items |
+
+### The Real Problem: Neither Uses the Other's Output
+
+**Validator runs first** (inside Extractor, `extractor_node.py:181`), produces `validation` dict stored in `state["validation"]`.
+
+**Reviewer runs second** but **never reads `state["validation"]`** (`reviewer.py:111` only reads `extracted_data`). The Reviewer:
+1. Calls `get_extraction()` — sees the extracted JSON
+2. Calls `get_gathered_content()` — sees raw content (40k char limit)
+3. Re-derives all the same checks the Validator already computed
+4. Has NO tool to see validation results
+
+This means:
+- If Validator found "FAILED_NUMBERS: claim has 39 not in protocol", the Reviewer doesn't know and wastes LLM tokens re-checking every number
+- If Validator verified 15/17 items, the Reviewer has no way to focus on just the 2 problematic ones
+- The Reviewer might DISAGREE with the Validator (LLM says "looks fine" for something Validator flagged), creating conflicting quality signals
+
+### What Should Happen
+
+**Option A: Remove Reviewer, enhance Validator**
+- The Validator is free (no LLM cost) and deterministic
+- Add cross-item validation (missing criteria count)
+- Add full source text matching (not just 40 chars)
+- Add number-in-source checking (not entire context)
+- Use saved $ to add more retrieval/extraction budget
+- **Downside**: Loses the LLM's ability to catch semantic hallucinations
+
+**Option B: Keep both, make them complementary (recommended)**
+- Validator: deterministic checks (grounding, numbers, references, completeness)
+- Reviewer: ONLY checks what Validator can't — semantic hallucination, missed nuance, cross-section contradictions
+- **Give the Reviewer access to validation results** via a `get_validation()` tool
+- Reviewer's prompt should say: "The validator has already verified grounding and numbers. Focus on semantic accuracy and completeness."
+- **Result**: Reviewer becomes a focused semantic checker instead of a redundant pattern matcher
+
+**Option C: Merge into a Reconciler node**
+- Single node that runs deterministic checks first, then LLM checks only for flagged/failed items
+- Runs the Validator's 4 levels
+- For any FAILED or FLAGGED items, asks the LLM to investigate specifically
+- Also handles vision vs text table reconciliation
+- Also computes derived counts (replacing manual `EndpointCounts`, `total_rules`, etc.)
+
+---
+
 ## HOW TO USE THIS DOCUMENT
 
 This audit identifies **70+ concrete issues**. The recommended approach:
