@@ -48,7 +48,7 @@ def initialize(pdf_path: str, json_data: dict | None = None):
             json_data = {"sections": [], "tables": []}
 
     # Build store
-    from knowledge_base.protocol_store import ProtocolStore
+    from protocol_engine.store import ProtocolStore
     store = ProtocolStore(json_data)
 
     # Build retriever

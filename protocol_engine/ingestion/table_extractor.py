@@ -12,10 +12,17 @@ from __future__ import annotations
 import re
 import pdfplumber
 
-from ingestion.src.models import (
-    ExtractedTable, TableCell, RowMetadata, RowType,
-    ColumnGroup, Source, ExtractionMethod,
-)
+try:
+    from ingestion.src.models import (
+        ExtractedTable, TableCell, RowMetadata, RowType,
+        ColumnGroup, Source, ExtractionMethod,
+    )
+except ImportError:
+    # Self-contained fallback — minimal dataclasses for standalone use
+    from protocol_engine.ingestion._models import (
+        ExtractedTable, TableCell, RowMetadata, RowType,
+        ColumnGroup, Source, ExtractionMethod,
+    )
 
 # ── Table extraction strategies ──────────────────────────────────────────────
 

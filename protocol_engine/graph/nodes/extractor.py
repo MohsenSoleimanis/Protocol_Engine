@@ -198,7 +198,7 @@ def _extract_with_structured_output(
 
     Returns: (parsed_result, raw_text, info_dict)
     """
-    from shared.json_parser import parse_llm_json
+    from protocol_engine.utils import parse_llm_json
 
     lf = get_langfuse_handler()
     callbacks = [lf] if lf else []

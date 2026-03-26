@@ -106,39 +106,13 @@ def ingest_protocol(
 
 
 def _run_pdf_pipeline(pdf_path: str, output_prefix: str, with_llm: bool) -> dict:
-    """Run the existing ingestion pipeline and return the JSON data."""
-    try:
-        # Try to import and use the existing pipeline
-        import sys
-        from pathlib import Path
-
-        # Add ingestion directory to path
-        ingestion_dir = Path(pdf_path).parent / "ingestion"
-        if not ingestion_dir.exists():
-            ingestion_dir = Path(__file__).parent.parent.parent / "ingestion"
-
-        if ingestion_dir.exists() and str(ingestion_dir) not in sys.path:
-            sys.path.insert(0, str(ingestion_dir))
-
-        from ingestion.run import process_document
-        result = process_document(
-            pdf_path=pdf_path,
-            output_prefix=output_prefix,
-            with_llm=with_llm,
-        )
-
-        # Load the generated JSON
-        json_path = Path(f"{output_prefix}_structured.json")
-        if json_path.exists():
-            return json.loads(json_path.read_text())
-
-        # Fallback: convert the DocumentResult to dict
-        return result.model_dump(mode="json", exclude_none=True)
-
-    except ImportError as e:
-        logger.warning(f"Could not import ingestion pipeline: {e}")
-        logger.info("Returning empty data — run ingestion manually first")
-        return {"sections": [], "tables": [], "total_pages": 0}
+    """Run the PDF parsing pipeline via the legacy bridge."""
+    from protocol_engine.ingestion._legacy import run_legacy_pipeline
+    return run_legacy_pipeline(
+        pdf_path=pdf_path,
+        output_prefix=output_prefix,
+        with_llm=with_llm,
+    )
 
 
 def _extract_sections_from_json(json_data: dict) -> list[dict]:
