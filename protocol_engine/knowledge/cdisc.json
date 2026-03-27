@@ -1,0 +1,104 @@
+{
+  "sdtm_domains": {
+    "DM": {
+      "name": "Demographics",
+      "variables": ["AGE", "SEX", "RACE", "ETHNIC", "COUNTRY", "SITEID", "RFSTDTC", "DTHFL"]
+    },
+    "VS": {
+      "name": "Vital Signs",
+      "variables": ["VSTESTCD"],
+      "test_codes": ["TEMP", "SYSBP", "DIABP", "HR", "RESP", "WEIGHT", "HEIGHT", "BMI"]
+    },
+    "LB": {
+      "name": "Laboratory",
+      "variables": ["LBTESTCD"],
+      "test_codes": ["ALT", "AST", "CREAT", "HGB", "WBC", "PLT", "GLUC", "BILI", "PREG"]
+    },
+    "MH": {
+      "name": "Medical History",
+      "variables": ["MHTERM", "MHDECOD", "MHONGO"],
+      "coding_dictionary": "MedDRA"
+    },
+    "CM": {
+      "name": "Concomitant Meds",
+      "variables": ["CMTRT", "CMDECOD", "CMCAT", "CMONGO"],
+      "coding_dictionary": "WHODrug"
+    },
+    "AE": {
+      "name": "Adverse Events",
+      "variables": ["AETERM", "AEDECOD", "AESEV", "AESER"]
+    },
+    "EX": {
+      "name": "Exposure",
+      "variables": ["EXTRT", "EXDOSE", "EXROUTE", "EXSTDTC", "EXENDTC"]
+    },
+    "DS": {
+      "name": "Disposition",
+      "variables": ["DSDECOD"],
+      "controlled_terms": ["COMPLETED", "SCREEN FAILURE", "ADVERSE EVENT"]
+    },
+    "IE": {
+      "name": "Inclusion/Exclusion",
+      "variables": ["IETESTCD", "IESTRESC"],
+      "controlled_terms": ["Y", "N"]
+    },
+    "SC": {
+      "name": "Subject Characteristics",
+      "variables": ["SCTESTCD"]
+    },
+    "SV": {
+      "name": "Subject Visits",
+      "variables": ["VISITNUM", "VISITDY", "SVSTDTC"],
+      "note": "Actual visit date"
+    },
+    "TV": {
+      "name": "Trial Visits",
+      "variables": ["VISITNUM", "VISITDY"],
+      "note": "Planned visit day"
+    },
+    "DV": {
+      "name": "Protocol Deviations",
+      "variables": ["DVTERM", "DVCAT", "DVDECOD"]
+    }
+  },
+  "controlled_terminology": {
+    "trial_type": {
+      "code": "C66731",
+      "values": ["Randomized", "Non-randomized", "Observational", "Expanded Access"]
+    },
+    "study_phase": {
+      "code": "C49666",
+      "values": ["Phase I", "Phase I/II", "Phase II", "Phase II/III", "Phase III", "Phase IV"]
+    },
+    "blinding_schema": {
+      "code": "C49660",
+      "values": ["Open Label", "Single Blind", "Double Blind", "Triple Blind"]
+    },
+    "arm_type": {
+      "code": "C66767",
+      "values": ["Experimental", "Active Comparator", "Placebo Comparator", "Sham Comparator", "No Intervention"]
+    },
+    "route_of_admin": {
+      "code": "C66729",
+      "values": ["INTRAMUSCULAR", "INTRAVENOUS", "ORAL", "SUBCUTANEOUS", "TOPICAL"]
+    },
+    "analysis_population": {
+      "code": "C71106",
+      "values": ["ITT", "mITT", "Per-Protocol", "Safety Population"]
+    }
+  },
+  "deviation_categories": {
+    "eligibility": "enrollment of ineligible subject",
+    "dosing": "wrong dose, missed dose, wrong route",
+    "visit_compliance": "visit outside window, missed visit",
+    "prohibited_medication": "use of disallowed concomitant medication",
+    "safety_reporting": "late SAE report, missed AESI notification",
+    "consent": "consent issues",
+    "assessment": "missed protocol-required assessment"
+  },
+  "automation_levels": {
+    "FULL": "computable from SDTM data alone (DM.AGE >= 18)",
+    "PARTIAL": "needs data + clinical interpretation",
+    "MANUAL": "purely subjective, no SDTM variable exists"
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "kri_framework": {
+    "source": "ICH E6(R3) §5.0 and TransCelerate RBQM",
+    "categories": {
+      "enrollment": {
+        "indicators": ["Screening Failure Rate", "Enrollment Rate", "Randomization Imbalance"],
+        "sdtm_source": "DS domain"
+      },
+      "safety": {
+        "indicators": ["AE Reporting Rate", "SAE Reporting Timeliness", "AESI Incidence Rate", "Dose Modification Rate"],
+        "sdtm_source": "AE, EX domains"
+      },
+      "data_quality": {
+        "indicators": ["Query Rate", "Data Entry Lag", "Missing Data Rate"],
+        "sdtm_source": "Multiple domains"
+      },
+      "visit_compliance": {
+        "indicators": ["Visit Window Compliance", "Early Discontinuation Rate"],
+        "sdtm_source": "SV vs TV domains"
+      },
+      "protocol_deviation": {
+        "indicators": ["Overall Deviation Rate", "Eligibility Deviation Rate", "Dosing Deviation Rate", "Prohibited Med Violations"],
+        "sdtm_source": "DV, IE, EX, CM domains"
+      },
+      "consent": {
+        "indicators": ["Consent Before Procedures Rate", "Re-consent Compliance"],
+        "sdtm_source": "DS domain"
+      }
+    },
+    "kri_components": {
+      "protocol_source": "which section defines the requirement",
+      "sdtm_data_source": "which domain/variables to compute it",
+      "metric": "rate, count, proportion, or time",
+      "qtl_threshold": "what level triggers a signal",
+      "signal_direction": "above, below, or both"
+    }
+  },
+  "domain_keywords": {
+    "endpoints": ["endpoint", "objective", "efficacy"],
+    "eligibility": ["eligib", "inclusion", "exclusion", "population"],
+    "soa": ["schedule", "activities", "event", "visit", "appendix 1"],
+    "safety": ["safety", "adverse", "aesi", "monitoring", "stopping"],
+    "statistical": ["statistic", "analysis", "sample size", "power"],
+    "study_design": ["design", "rationale", "phase", "randomiz", "blind"],
+    "intervention": ["intervention", "treatment", "dosage", "dose", "drug", "vaccine"],
+    "overview": ["synopsis", "summary", "overview", "introduction"],
+    "regulatory": ["regulatory", "ethical", "irb", "consent", "compliance"],
+    "administrative": ["abbrevi", "definition", "reference", "appendix"]
+  }
+}
