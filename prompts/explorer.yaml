@@ -1,0 +1,63 @@
+# Explorer — system prompt for agentic content gathering.
+
+system: |
+  You are a clinical protocol navigator.
+  Use search() to find content, read_section() for specific sections,
+  vision_extract() for complex tables. Stop when you have enough.
+
+# Per query_type goals for schema-based retrieval.
+goals:
+  endpoints: "Find ALL endpoint content: primary, secondary, exploratory objectives, case definitions, thresholds, timing."
+  eligibility: "Find ALL eligibility criteria: inclusion and exclusion. Follow cross-references."
+  safety: "Find ALL safety content: AESIs, monitoring rules, stopping rules, AE collection windows, SAE reporting."
+  study_design: "Find study design: phase, randomization, blinding, stratification, sample size, dosing, arms."
+  intervention: "Find study intervention details: drug/vaccine name, dose, route, formulation, comparator, storage."
+  statistical: "Find statistical design: sample size, power, analysis populations, interim analyses."
+  soa: "Find ALL Schedule of Activities tables. Use vision_extract for each table."
+  deviation: "Find eligibility criteria AND Schedule of Activities."
+  kri: "Derive Key Risk Indicators from the protocol."
+  risk: "Find safety monitoring, endpoint definitions, schedule of activities."
+  ambiguity: "Find eligibility criteria, safety definitions. Look for undefined terms."
+  consistency: "Find synopsis, endpoint definitions, AND statistical methods. Compare across sections."
+
+# Retrieval queries per query type (ICH M11 vocabulary for semantic search).
+retrieval_queries:
+  endpoints:
+    - "objectives and endpoints primary secondary exploratory"
+    - "estimand endpoint definition population intercurrent events"
+    - "efficacy endpoint analysis assessment timepoint"
+  eligibility:
+    - "inclusion criteria participants eligible enrollment"
+    - "exclusion criteria medical conditions disqualification"
+    - "lifestyle considerations contraception restrictions"
+  safety:
+    - "adverse events serious adverse events reporting monitoring"
+    - "adverse events special interest AESI definition criteria"
+    - "stopping rules discontinuation safety monitoring committee"
+  study_design:
+    - "overall design randomization blinding stratification"
+    - "sample size determination enrollment participants"
+    - "study intervention dose route administration treatment arms"
+  intervention:
+    - "investigational product dose formulation route"
+    - "concomitant therapy prohibited permitted medications"
+    - "dose modification discontinuation treatment compliance"
+  statistical:
+    - "sample size determination power calculation"
+    - "analysis populations intent-to-treat per-protocol"
+    - "interim analysis data monitoring committee multiplicity"
+  soa:
+    - "schedule of activities visit procedures assessments"
+  deviation:
+    - "eligibility criteria schedule of activities"
+  kri:
+    - "screening failure enrollment inclusion exclusion"
+    - "adverse event reporting rate collection monitoring"
+    - "visit schedule compliance assessment window"
+  risk:
+    - "safety monitoring adverse events stopping rules"
+  ambiguity:
+    - "eligibility criteria safety definitions"
+  consistency:
+    - "synopsis protocol summary objectives endpoints"
+    - "statistical analysis primary secondary endpoint"

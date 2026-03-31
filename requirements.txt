@@ -19,8 +19,9 @@ pdfplumber>=0.10.0
 # === Data / schemas ===
 pydantic>=2.5.0
 
-# === Config ===
+# === Config + prompts ===
 python-dotenv>=1.0.0
+pyyaml>=6.0
 
 # === Optional: tracing ===
 # langfuse>=2.0.0

@@ -29,57 +29,11 @@ from protocol_engine.models.state import get_runtime
 from protocol_engine.tools.search import make_search_tool
 from protocol_engine.tools.read_section import make_read_section_tool
 from protocol_engine.tools.vision import make_vision_tool
+from protocol_engine.prompts import load_prompt, render as render_prompt
 
 logger = logging.getLogger(__name__)
 
 MAX_TURNS = 8
-
-# Retrieval queries per query type (ICH M11 vocabulary)
-RETRIEVAL_QUERIES: dict[str, list[str]] = {
-    "endpoints": [
-        "objectives and endpoints primary secondary exploratory",
-        "estimand endpoint definition population intercurrent events",
-        "efficacy endpoint analysis assessment timepoint",
-    ],
-    "eligibility": [
-        "inclusion criteria participants eligible enrollment",
-        "exclusion criteria medical conditions disqualification",
-        "lifestyle considerations contraception restrictions",
-    ],
-    "safety": [
-        "adverse events serious adverse events reporting monitoring",
-        "adverse events special interest AESI definition criteria",
-        "stopping rules discontinuation safety monitoring committee",
-    ],
-    "study_design": [
-        "overall design randomization blinding stratification",
-        "sample size determination enrollment participants",
-        "study intervention dose route administration treatment arms",
-    ],
-    "intervention": [
-        "investigational product dose formulation route",
-        "concomitant therapy prohibited permitted medications",
-        "dose modification discontinuation treatment compliance",
-    ],
-    "statistical": [
-        "sample size determination power calculation",
-        "analysis populations intent-to-treat per-protocol",
-        "interim analysis data monitoring committee multiplicity",
-    ],
-    "soa": ["schedule of activities visit procedures assessments"],
-    "deviation": ["eligibility criteria schedule of activities"],
-    "kri": [
-        "screening failure enrollment inclusion exclusion",
-        "adverse event reporting rate collection monitoring",
-        "visit schedule compliance assessment window",
-    ],
-    "risk": ["safety monitoring adverse events stopping rules"],
-    "ambiguity": ["eligibility criteria safety definitions"],
-    "consistency": [
-        "synopsis protocol summary objectives endpoints",
-        "statistical analysis primary secondary endpoint",
-    ],
-}
 
 _XREF = [
     re.compile(r'(?:see|refer to)\s+(?:Section|§)\s*(\d+(?:\.\d+)*)', re.I),
@@ -128,7 +82,10 @@ def _schema_retrieve(runtime, qt: str, query: str):
     if not retriever:
         return {}, {}, "", {"agent": "explorer", "mode": "schema", "turns": 0}
 
-    queries = list(RETRIEVAL_QUERIES.get(qt, []))
+    # Load retrieval queries from externalized prompt config
+    explorer_config = load_prompt("explorer")
+    retrieval_queries = explorer_config.get("retrieval_queries", {})
+    queries = list(retrieval_queries.get(qt, []))
     if query:
         queries.insert(0, query)
 
@@ -221,7 +178,8 @@ def _agentic(runtime, state: dict, qt: str, query: str):
     llm = ChatOpenAI(model=LLM_MODEL, api_key=OPENAI_API_KEY,
                      temperature=0.1, callbacks=cbs).bind_tools(tools)
 
-    goal = query or f"Find all {qt} content in this protocol."
+    goals = load_prompt("explorer").get("goals", {})
+    goal = query or goals.get(qt, f"Find all {qt} content in this protocol.")
     msgs = [
         SystemMessage(content="You are a clinical protocol navigator. Use search() to find content, "
                       "read_section() for specific sections, vision_extract() for complex tables. "

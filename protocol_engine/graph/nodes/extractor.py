@@ -21,20 +21,10 @@ from protocol_engine.config import (
 from protocol_engine.models.enums import EdgeSignal
 from protocol_engine.models.state import get_runtime
 from protocol_engine.validation.validator import validate
+from protocol_engine.guardrails.output import validate_output
+from protocol_engine.prompts import render as render_prompt
 
 logger = logging.getLogger(__name__)
-
-SYSTEM_PROMPT = """You are a clinical protocol extraction specialist.
-
-RULES:
-1. COMPLETENESS: Extract EVERY item. Do not summarize or merge.
-2. PRESERVE THRESHOLDS: Include ALL clinical numbers verbatim.
-   WRONG: "fever threshold" → RIGHT: "fever (>= 38C)"
-3. GROUNDING: Every item needs section_id, page (from [Page N] markers),
-   exact_source_text (10-80 char verbatim quote), confidence (0.9/0.7/0.5).
-4. "NOT IN CONTEXT" ≠ "NOT IN PROTOCOL": You see a SUBSET.
-   If you can't find something, add to 'gaps' field. Don't claim it's missing.
-"""
 
 
 def extractor_node(state: dict, config: RunnableConfig) -> dict:
@@ -59,11 +49,10 @@ def extractor_node(state: dict, config: RunnableConfig) -> dict:
     from protocol_engine.models.schemas import SCHEMA_MAP
     schema_class = SCHEMA_MAP.get(qt, SCHEMA_MAP.get("general"))
 
-    # Load domain knowledge appendix if applicable
+    # Load prompt from externalized YAML + domain knowledge appendix
     appendix = _load_appendix(schema_class.__name__ if schema_class else "")
-
-    system = f"{SYSTEM_PROMPT}\nEXTRACT: {qt} information. Fill every field.\n{appendix}"
-    user_msg = f"Extract all {qt} information.\n\nPROTOCOL CONTENT:\n{context}"
+    system = render_prompt("extractor", "system", query_type=qt, appendix=appendix)
+    user_msg = render_prompt("extractor", "user", query_type=qt, context=context)
 
     t0 = time.time()
     result, raw, info = _extract(system, user_msg, schema_class)
@@ -85,8 +74,13 @@ def extractor_node(state: dict, config: RunnableConfig) -> dict:
     # Deterministic validation (source text, not full context — FIX C6)
     val = validate(extracted, context)
 
-    # Cross-field consistency (was in Reconciler, now inline)
+    # Cross-field consistency
     _cross_field_check(extracted, val)
+
+    # Output guardrails (clinical plausibility, PII, schema compliance)
+    extracted, output_warnings = validate_output(extracted, qt)
+    if output_warnings:
+        val.setdefault("output_warnings", []).extend(output_warnings)
 
     logger.info(f"Extractor: {val.get('verified',0)}/{val.get('total',0)} verified, {elapsed:.1f}s")
     if bus:

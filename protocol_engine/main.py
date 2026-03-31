@@ -50,8 +50,15 @@ def run_query(
 ) -> dict:
     """Run extraction through the 3-node graph."""
     from protocol_engine.graph.builder import protocol_graph
+    from protocol_engine.guardrails.input import sanitize_input
 
     t0 = time.time()
+
+    # Input guardrails
+    query, query_type, input_warnings = sanitize_input(query, query_type)
+    if input_warnings:
+        logger.warning(f"Input guardrails: {input_warnings}")
+
     logger.info(f"Query: {query_type} — '{query[:60]}'")
 
     initial: ProtocolState = {

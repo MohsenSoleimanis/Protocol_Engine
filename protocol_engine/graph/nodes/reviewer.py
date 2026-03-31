@@ -24,32 +24,11 @@ from protocol_engine.config import LLM_MODEL, OPENAI_API_KEY, MAX_CYCLES, get_la
 from protocol_engine.models.enums import EdgeSignal
 from protocol_engine.models.state import get_runtime
 from protocol_engine.tools.knowledge import lookup_knowledge
+from protocol_engine.prompts import render as render_prompt
 
 logger = logging.getLogger(__name__)
 
 MAX_TURNS = 8
-
-SYSTEM = """You are a SKEPTICAL clinical protocol reviewer.
-
-The deterministic validator ALREADY checked: source grounding, numbers, completeness.
-
-YOUR job (things the validator CANNOT check):
-  1. HALLUCINATION: Is anything plausible but NOT in the source?
-  2. SEMANTIC ACCURACY: Right text but wrong interpretation?
-  3. CLINICAL PLAUSIBILITY: Are values reasonable?
-  4. CROSS-SECTION CONTRADICTION: Do parts of the extraction conflict?
-
-Do NOT re-check source grounding or numbers.
-
-WORKFLOW:
-  1. get_extraction() → see the extracted data
-  2. get_validation() → see what the validator found
-  3. get_context() → see the source content (call ONCE)
-  4. flag() for verified semantic issues
-  5. done()
-
-SEVERITY: critical = extraction is WRONG. major = potential issue. minor = cosmetic.
-Only use critical if you're CERTAIN."""
 
 VALID_SIGNAL_TYPES = {"hallucination", "completeness", "consistency", "plausibility"}
 
@@ -125,11 +104,16 @@ def reviewer_node(state: dict, config: RunnableConfig) -> dict:
     llm = ChatOpenAI(model=LLM_MODEL, api_key=OPENAI_API_KEY,
                      temperature=0.1, callbacks=cbs).bind_tools(tools)
 
+    system_prompt = render_prompt("reviewer", "system")
+    user_prompt = render_prompt("reviewer", "user",
+                                query_type=qt,
+                                verified=validation.get('verified', 0),
+                                total=validation.get('total', 0),
+                                failed=validation.get('failed', 0))
+
     msgs = [
-        SystemMessage(content=SYSTEM),
-        HumanMessage(content=f"Review the {qt} extraction. "
-                     f"Validator: {validation.get('verified',0)}/{validation.get('total',0)} verified, "
-                     f"{validation.get('failed',0)} failed. Focus on semantic issues."),
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
     ]
     tmap = {t.name: t for t in tools}
     turns = 0
